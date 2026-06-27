@@ -1,17 +1,11 @@
-import json
+import base64
 import logging
 from datetime import date, timedelta
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-from bs4 import BeautifulSoup
 from requests import Session
 
 from easy_equities_client import constants
-from easy_equities_client.accounts.parsers import (
-    AccountHoldingsParser,
-    AccountOverviewParser,
-    get_transactions_from_page,
-)
 from easy_equities_client.accounts.types import (
     Account,
     Holding,
@@ -27,50 +21,105 @@ logger = logging.getLogger(__name__)
 class AccountsClient(Client):
     def __init__(self, base_url: str = "", session: Session = None):
         super().__init__(base_url, session)
-        self.current_account: Optional[str] = None
+        self._portfolio_cache: Optional[Dict] = None
 
-    def _get_account_overview_page(self) -> str:
-        response = self.session.get(self._url(constants.PLATFORM_ACCOUNT_OVERVIEW_PATH))
-        assert response.status_code == 200, (
-            "Account overview page should return 200 status code"
-        )
-        assert "My Investments" in str(response.content)
-        return str(response.content)
-
-    def list(self) -> List[Account]:
-        page = self._get_account_overview_page()
-        parser = AccountOverviewParser(page)
-        return parser.extract_accounts()
-
-    def _switch_account(self, account_id: str) -> None:
+    def _get_portfolio_overview(self, force_refresh: bool = False) -> Dict:
         """
-        Switch the currently selected account to account with ID account_id.
+        Fetch and cache the REST API portfolio overview.
+        Returns the full response dict from /portfolios/v3/portfolio-overview.
         """
-        if self.current_account != account_id:
-            data = {"trustAccountId": account_id}
-            response = self.session.post(
-                self._url(constants.PLATFORM_UPDATE_CURRENCY_PATH), data
+        if self._portfolio_cache is None or force_refresh:
+            response = self.session.get(
+                constants.REST_API_BASE_URL + constants.REST_PORTFOLIO_OVERVIEW_PATH
             )
             response.raise_for_status()
-            assert response.status_code == 200, (
-                "Update currency request should return 200 status code"
+            self._portfolio_cache = response.json()
+        return self._portfolio_cache
+
+    def _find_account(self, account_id: str) -> Optional[Dict]:
+        """Return the investmentAccount dict matching account_id (accountNumber)."""
+        overview = self._get_portfolio_overview()
+        for acc in overview.get("investmentAccounts", []):
+            if acc.get("accountNumber") == account_id:
+                return acc
+        return None
+
+    def _decode_image_uri(self, image_uri: str) -> str:
+        """Decode base64-encoded image URI to a plain URL."""
+        try:
+            return base64.b64decode(image_uri).decode("utf-8")
+        except Exception:
+            return image_uri
+
+    def list(self) -> List[Account]:
+        """Return all investment accounts for the authenticated user."""
+        overview = self._get_portfolio_overview()
+        accounts = []
+        for acc in overview.get("investmentAccounts", []):
+            accounts.append(
+                Account(
+                    id=acc["accountNumber"],
+                    name=acc["productName"],
+                    trading_currency_id=str(acc.get("productId", "")),
+                )
             )
-            self.current_account = account_id
+        return accounts
 
     def valuations(self, account_id: str) -> Valuation:
-        self._switch_account(account_id)
-        response = self.session.get(
-            self._url(constants.PLATFORM_ACCOUNT_VALUATIONS_PATH)
+        """
+        Return valuation data for the given account.
+
+        Returns a dict with keys mapped from the REST API portfolio overview
+        response for the matching account.
+        """
+        self._portfolio_cache = None
+        acc = self._find_account(account_id)
+        if acc is None:
+            raise ValueError(f"Account '{account_id}' not found in portfolio overview.")
+
+        aggregates = acc.get("aggregates", [])
+        accruals = acc.get("accruals", [])
+        costs = acc.get("costs", {})
+
+        investment_types = next(
+            (a for a in aggregates if a.get("aggregateName") == "Investment Type"), {}
         )
-        response.raise_for_status()
-        return json.loads(response.json())
+        managers = next(
+            (a for a in aggregates if a.get("aggregateName") == "Manager"), {}
+        )
+
+        income_accruals = next(
+            (a for a in accruals if a.get("accrualName") == "Income"), {}
+        )
+        expense_accruals = next(
+            (a for a in accruals if a.get("accrualName") == "Expense"), {}
+        )
+
+        return {
+            "accountNumber": acc.get("accountNumber"),
+            "productName": acc.get("productName"),
+            "currencyCode": acc.get("currencyCode"),
+            "totalInvestmentHoldingsValue": acc.get("totalInvestmentHoldingsValue"),
+            "InvestmentTypesAndManagers": {
+                "types": investment_types.get("items", []),
+                "managers": managers.get("items", []),
+            },
+            "AccrualIncomeSummaryItems": income_accruals.get("items", []),
+            "AccrualExpenseSummaryItems": expense_accruals.get("items", []),
+            "CostsSummaryItems": costs.get("items", []) if isinstance(costs, dict) else [],
+            "costsTotal": costs.get("costsTotal", 0) if isinstance(costs, dict) else 0,
+        }
 
     def transactions(self, account_id: str) -> List[Transaction]:
         """
-        Gets JSON-formatted transactions for the last year.
+        Gets transactions for the given account via the REST API.
         """
-        self._switch_account(account_id)
-        response = self.session.get(self._url(constants.PLATFORM_TRANSACTIONS_PATH))
+        url = (
+            constants.REST_API_BASE_URL
+            + constants.REST_TRANSACTIONS_PATH
+            + f"?accountNumber={account_id}"
+        )
+        response = self.session.get(url)
         response.raise_for_status()
         return response.json()
 
@@ -78,13 +127,10 @@ class AccountsClient(Client):
         self, account_id: str, start_date: date, end_date: date
     ) -> List[TransactionForPeriod]:
         """
-        Gets transactions for a given period. Unfortunately not JSON-formatted
-        and contains less useful data than the yearly data, because we need
-        to get it from the UI.
+        Gets transactions for a given period via the REST API.
 
         Returns transactions ordered in reverse chronological order (newest to oldest).
         """
-        self._switch_account(account_id)
         transactions: List[Any] = []
 
         current_start = start_date
@@ -92,26 +138,17 @@ class AccountsClient(Client):
 
         while current_start < end_date:
             logger.debug(f"Current start: {current_start}, Current end: {current_end}")
-            transactions_for_date_range = []
 
-            page_number = 1
-            while True:
-                next_url = self._url(
-                    constants.PLATFORM_TRANSACTIONS_SEARCH_PATH_NEXT_PAGE.format(
-                        start_date=f"{current_start.month}/{current_start.day}/{current_start.year}",
-                        end_date=f"{current_end.month}/{current_end.day}/{current_end.year}",
-                        page_number=page_number,
-                    )
-                )
-                response = self.session.get(next_url)
-                new_transactions = get_transactions_from_page(response.content)
-                if len(new_transactions) == 0:
-                    # No more transactions left
-                    break
-                transactions_for_date_range += new_transactions
-                page_number += 1
-
-            transactions = transactions_for_date_range + transactions
+            url = (
+                constants.REST_API_BASE_URL
+                + constants.REST_TRANSACTIONS_PATH
+                + f"?accountNumber={account_id}"
+                f"&startDate={current_start.isoformat()}"
+                f"&endDate={current_end.isoformat()}"
+            )
+            response = self.session.get(url)
+            new_transactions = response.json() if response.status_code == 200 else []
+            transactions = list(new_transactions) + transactions
 
             current_start = current_end + timedelta(days=1)
             current_end = min(end_date, current_start + timedelta(days=90))
@@ -120,26 +157,37 @@ class AccountsClient(Client):
 
     def holdings(self, account_id: str, include_shares: bool = False) -> List[Holding]:
         """
-        Get an account's holdings/stocks.
+        Get an account's holdings/stocks from the REST API portfolio overview.
 
-        :param account_id: String account ID.
-        :param include_shares: Whether to fetch the number of shares per holding. Create an extra
-        HTTP request per holding.
+        :param account_id: String account ID (accountNumber).
+        :param include_shares: Included for backward compatibility; shares data is
+            already present in the REST API response as 'units'.
         """
-        self._switch_account(account_id)
-        response = self.session.get(self._url(constants.PLATFORM_HOLDINGS_PATH))
-        response.raise_for_status()
-        parser = AccountHoldingsParser(response.content)
-        holdings = parser.extract_holdings()
-        if include_shares:
-            for holding in holdings:
-                response = self.session.get(self._url(holding["view_url"]))
-                soup = BeautifulSoup(response.content, "html.parser")
-                whole_shares = soup.find(
-                    lambda tag: "#Shares" in tag
-                ).next_sibling.next_sibling.text.strip()
-                partial_shares = soup.find(
-                    lambda tag: "#FSR" in tag
-                ).next_sibling.next_sibling.text.strip()
-                holding["shares"] = f"{whole_shares}{partial_shares}"
+        self._portfolio_cache = None
+        acc = self._find_account(account_id)
+        if acc is None:
+            raise ValueError(f"Account '{account_id}' not found in portfolio overview.")
+
+        holdings: List[Holding] = []
+        currency = acc.get("currencyCode", "")
+
+        for asset in acc.get("assets", []):
+            image_uri = asset.get("imageUri", "")
+            img_url = self._decode_image_uri(image_uri) if image_uri else ""
+
+            holding: Holding = {
+                "name": asset.get("assetName", ""),
+                "contract_code": asset.get("contractCode", ""),
+                "purchase_value": f"{currency} {asset.get('purchaseValue', 0)}",
+                "current_value": f"{currency} {asset.get('currentValue', 0)}",
+                "current_price": f"{currency} {asset.get('currentPrice', 0)}",
+                "img": img_url,
+                "view_url": "",
+                "isin": asset.get("assetCode", ""),
+                "shares": str(asset.get("units", "")),
+                "profit_loss_value": asset.get("profitLossValue", 0),
+                "profit_loss_percentage": asset.get("profitLossPercentage", 0),
+            }
+            holdings.append(holding)
+
         return holdings
