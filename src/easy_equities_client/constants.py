@@ -12,12 +12,27 @@ class Platform(CustomEnum):
     SATRIX = "Satrix"
 
 
-# Platform constants
-
-EASY_EQUITIES_BASE_PLATFORM_URL = "https://platform.easyequities.io"
+# --- Platform frontend URLs ---
+# The old platform.easyequities.io now redirects to portfolio-overview.apps.easyequities.io.
+EASY_EQUITIES_BASE_PLATFORM_URL = "https://portfolio-overview.apps.easyequities.io"
 SATRIX_BASE_PLATFORM_URL = "https://platform.satrixnow.co.za"
 
+# Sign-in entry point — still used to start the OAuth2 PKCE flow.
 PLATFORM_SIGN_IN_PATH = "/Account/SignIn"
+
+# --- Identity server (OAuth2/OIDC provider) ---
+IDENTITY_BASE_URL = "https://identity.openeasy.io"
+IDENTITY_SIGN_IN_PATH = "/Account/Login"
+IDENTITY_OAUTH_CALLBACK_PATH = "/connect/authorize/callback"
+
+# --- REST API (new platform backend, replaces old HTML-scraped endpoints) ---
+REST_API_BASE_URL = "https://rest.synatic.openeasy.io/easyequities"
+REST_PORTFOLIO_OVERVIEW_PATH = "/portfolios/v3/portfolio-overview"
+REST_NAV_CHART_PATH = "/portfolios/nav_chart_data/{period}"
+REST_TRANSACTIONS_PATH = "/portfolios/transactions"
+
+# --- Legacy constants (kept for backward compatibility with existing tests) ---
+# These endpoints no longer respond correctly on the live platform.
 PLATFORM_ACCOUNT_OVERVIEW_PATH = "/AccountOverview"
 PLATFORM_CAN_USE_ACCOUNT_PATH = "/Menu/CanUseSelectedAccount"
 PLATFORM_UPDATE_CURRENCY_PATH = "/Menu/UpdateCurrency"

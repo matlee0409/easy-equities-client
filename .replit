@@ -5,4 +5,4 @@ stack = "BEST_EFFORT_FALLBACK"
 
 [nix]
 channel = "stable-25_05"
-packages = ["xcodebuild", "zlib"]
+packages = ["gitFull", "playwright-driver", "xcodebuild", "zlib"]

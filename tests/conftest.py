@@ -16,10 +16,14 @@ def base_platform_url():
 
 
 @pytest.fixture
-def mock_success_login_response(requests_mock):
+def mock_success_login_response(mocker):
+    """
+    Mock a successful login by patching PlatformClient.login to return True
+    without launching a real browser. The actual OAuth2 PKCE + Playwright
+    flow is covered by integration tests run against the live platform.
+    """
     def _mock_success_login_response(base_url):
-        url = base_url + constants.PLATFORM_SIGN_IN_PATH
-        requests_mock.post(url, status_code=302)
+        mocker.patch.object(PlatformClient, "login", return_value=True)
 
     return _mock_success_login_response
 
