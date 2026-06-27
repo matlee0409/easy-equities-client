@@ -210,6 +210,92 @@ class AccountsClient(Client):
 
         return transactions
 
+    def nav_chart(self, account_id: str, period: str = "1mo") -> dict:
+        """
+        Return the portfolio NAV (Net Asset Value) chart data for the given account.
+
+        The EasyEquities REST API endpoint ``/portfolios/nav_chart_data/{period}``
+        returns an empty response for accounts with no trading history. For accounts
+        that have holdings and transactions, it returns time-series NAV data.
+
+        Supported period strings: ``"1W"``, ``"1mo"``, ``"3mo"``, ``"6mo"``, ``"1Y"``
+
+        :param account_id: Account number string (e.g. 'EE3237137-15547214').
+        :param period: Time period string. Default ``"1mo"``.
+        :return: Dict with:
+            - ``success``    — True if chart data is available
+            - ``account_id`` — the requested account
+            - ``period``     — the requested period
+            - ``data``       — list of ``{"date": str, "nav": float}`` points,
+              empty if the account has no trade history
+            - ``message``    — explanation if no data is available
+
+        Example::
+
+            chart = client.accounts.nav_chart("EE3237137-15547214", period="3mo")
+            if chart["success"]:
+                for point in chart["data"]:
+                    print(point["date"], point["nav"])
+            else:
+                print(chart["message"])
+        """
+        url = constants.REST_API_BASE_URL + f"/portfolios/nav_chart_data/{period}"
+        headers = {
+            "Origin": "https://portfolio-overview.apps.easyequities.io",
+            "Referer": "https://portfolio-overview.apps.easyequities.io/",
+            "Accept": "application/json, text/plain, */*",
+        }
+        try:
+            r = self.session.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            raw = r.json()
+        except Exception as exc:
+            return {
+                "success": False,
+                "account_id": account_id,
+                "period": period,
+                "data": [],
+                "message": f"Request failed: {exc}",
+            }
+
+        if not raw:
+            return {
+                "success": False,
+                "account_id": account_id,
+                "period": period,
+                "data": [],
+                "message": (
+                    "No NAV chart data returned. This account has no trading history "
+                    "yet — NAV chart data is only available for accounts with completed "
+                    "buy/sell transactions."
+                ),
+            }
+
+        points = []
+        if isinstance(raw, list):
+            for entry in raw:
+                date = entry.get("Date") or entry.get("date") or entry.get("x")
+                nav = entry.get("Nav") or entry.get("nav") or entry.get("y") or entry.get("Value")
+                if date and nav is not None:
+                    points.append({"date": str(date)[:10], "nav": float(nav)})
+        elif isinstance(raw, dict):
+            for key in ("data", "Data", "points", "Points", "series", "Series"):
+                if key in raw and isinstance(raw[key], list):
+                    for entry in raw[key]:
+                        date = entry.get("Date") or entry.get("date") or entry.get("x")
+                        nav = entry.get("Nav") or entry.get("nav") or entry.get("y") or entry.get("Value")
+                        if date and nav is not None:
+                            points.append({"date": str(date)[:10], "nav": float(nav)})
+                    break
+
+        return {
+            "success": True,
+            "account_id": account_id,
+            "period": period,
+            "data": points,
+            "message": None,
+        }
+
     def holdings(self, account_id: str, include_shares: bool = False) -> List[Holding]:
         """
         Get an account's holdings from the REST API portfolio overview.
