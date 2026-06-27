@@ -12,6 +12,8 @@ from easy_equities_client.instruments.types import (
     NormalisedPoint,
     Period,
     PricePoint,
+    ScreenerEntry,
+    ScreenerResult,
     TopMoverEntry,
     TopMoversResult,
 )
@@ -772,5 +774,255 @@ class InstrumentsClient(Client):
             "scanned": len(entries),
             "gainers": gainers,
             "losers": losers,
+            "message": None,
+        }
+
+    def screener(
+        self,
+        asset_group: str = "Equities",
+        period: Period = Period.ONE_MONTH,
+        min_return: Optional[float] = None,
+        max_return: Optional[float] = None,
+        sub_group: Optional[str] = None,
+        scan_limit: int = 200,
+    ) -> ScreenerResult:
+        """
+        Filter instruments by return thresholds and sub-group, returning every
+        match sorted best-to-worst by total return over the period.
+
+        Uses a single ``yfinance.download()`` batch call for all tickers, so
+        scanning hundreds of instruments adds no extra latency beyond one call.
+
+        :param asset_group: EasyEquities asset group to search within. One of:
+            ``"Equities"``, ``"ETFs"``, ``"US ETFs"``, ``"Bonds"``,
+            ``"Crypto"``, ``"Unit Trusts"``, ``"ETNs"``, ``"US ETNs"``,
+            ``"Property"``. Default ``"Equities"``.
+        :param period: Time period as a ``Period`` enum. Default
+            ``Period.ONE_MONTH``.
+        :param min_return: Inclusive lower bound on total return percentage.
+            E.g. ``5.0`` keeps only instruments up ≥ 5 %. ``None`` = no lower
+            bound.
+        :param max_return: Inclusive upper bound on total return percentage.
+            E.g. ``-5.0`` keeps only instruments down ≥ 5 %. ``None`` = no
+            upper bound.
+        :param sub_group: Filter by ``AssetSubGroup`` (case-insensitive
+            substring match). E.g. ``"Technology"`` matches
+            ``"Technology Hardware & Equipment"`` and
+            ``"Technology Software & Services"``. ``None`` = all sub-groups.
+        :param scan_limit: Maximum instruments to scan before sampling.
+            Default ``200``.
+        :return: ``ScreenerResult`` dict containing:
+
+            - ``success``        — True if matches were found
+            - ``asset_group``    — group searched
+            - ``asset_sub_group`` — sub_group filter applied (or None)
+            - ``period``         — period used
+            - ``min_return``     — lower bound applied (or None)
+            - ``max_return``     — upper bound applied (or None)
+            - ``scanned``        — total instruments with price data evaluated
+            - ``matched``        — number passing all filters
+            - ``matches``        — list of ``ScreenerEntry`` dicts, sorted
+              best-to-worst by ``total_return_pct``
+            - ``message``        — detail when ``success`` is False
+
+            Each ``ScreenerEntry`` contains:
+            ``contract_code``, ``name``, ``ticker``, ``asset_group``,
+            ``asset_sub_group``, ``total_return_pct``, ``first_close``,
+            ``last_close``, ``first_date``, ``last_date``.
+
+        Examples::
+
+            from easy_equities_client.instruments.types import Period
+
+            # All US ETFs that gained more than 5 % in the last month
+            result = client.instruments.screener(
+                asset_group="US ETFs",
+                period=Period.ONE_MONTH,
+                min_return=5.0,
+            )
+
+            # SA equities in Technology down between 5 % and 20 % over 3 months
+            result = client.instruments.screener(
+                asset_group="Equities",
+                period=Period.THREE_MONTHS,
+                min_return=-20.0,
+                max_return=-5.0,
+                sub_group="Technology",
+            )
+
+            for match in result["matches"]:
+                print(
+                    f"{match['total_return_pct']:+.2f}%  "
+                    f"{match['ticker']:10s}  {match['name']}"
+                )
+        """
+        try:
+            import random
+            import yfinance as yf
+            import pandas as pd
+        except ImportError:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "asset_sub_group": sub_group,
+                "period": period.value if isinstance(period, Period) else str(period),
+                "min_return": min_return,
+                "max_return": max_return,
+                "scanned": 0,
+                "matched": 0,
+                "matches": [],
+                "message": "yfinance is not installed. Install it with: pip install yfinance",
+            }
+
+        period_str = period.value if isinstance(period, Period) else str(period)
+        yf_period = _PERIOD_MAP.get(period, period_str) if isinstance(period, Period) else period_str
+
+        def _fail(msg: str) -> ScreenerResult:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "asset_sub_group": sub_group,
+                "period": period_str,
+                "min_return": min_return,
+                "max_return": max_return,
+                "scanned": 0,
+                "matched": 0,
+                "matches": [],
+                "message": msg,
+            }
+
+        # --- 1. Fetch instruments, apply sub_group filter, deduplicate ---
+        all_instruments = self._fetch_all_instruments()
+
+        candidate_instruments = [
+            i for i in all_instruments
+            if i.get("AssetGroup") == asset_group
+        ]
+
+        if sub_group:
+            sub_lower = sub_group.lower()
+            candidate_instruments = [
+                i for i in candidate_instruments
+                if sub_lower in i.get("AssetSubGroup", "").lower()
+            ]
+
+        # Deduplicate by contract code, keeping the first occurrence
+        seen_codes: set = set()
+        unique_instruments: List[InstrumentDetail] = []
+        for inst in candidate_instruments:
+            code = inst.get("ContractCode", "")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                unique_instruments.append(inst)
+
+        if not unique_instruments:
+            msg = f"No instruments found for asset_group='{asset_group}'"
+            if sub_group:
+                msg += f", sub_group='{sub_group}'"
+            msg += (
+                ". Valid asset groups: Equities, ETFs, US ETFs, Bonds, Crypto, "
+                "Unit Trusts, ETNs, US ETNs, Property."
+            )
+            return _fail(msg)
+
+        # Sample if necessary
+        if len(unique_instruments) > scan_limit:
+            logger.info(
+                f"screener: {len(unique_instruments)} unique instruments, "
+                f"sampling {scan_limit}."
+            )
+            unique_instruments = random.sample(unique_instruments, scan_limit)
+
+        # --- 2. Resolve Yahoo tickers, build ticker → instrument map ---
+        ticker_map: Dict[str, tuple] = {}
+        for inst in unique_instruments:
+            ticker = _resolve_yahoo_ticker(inst)
+            if ticker and ticker not in ticker_map:
+                ticker_map[ticker] = (inst.get("ContractCode", ""), inst)
+
+        tickers = list(ticker_map.keys())
+        if not tickers:
+            return _fail("Could not resolve any Yahoo Finance tickers for this filter.")
+
+        # --- 3. Batch-download all tickers ---
+        logger.debug(f"screener: batch-downloading {len(tickers)} tickers (period={yf_period})")
+        try:
+            raw = yf.download(
+                tickers=tickers,
+                period=yf_period,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+        except Exception as exc:
+            return _fail(f"yfinance batch download failed: {exc}")
+
+        if raw.empty:
+            return _fail("No price data returned by Yahoo Finance for any ticker in this filter.")
+
+        # --- 4. Extract Close prices ---
+        if isinstance(raw.columns, pd.MultiIndex):
+            close_df = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+        else:
+            if "Close" in raw.columns:
+                close_df = raw[["Close"]].rename(columns={"Close": tickers[0]})
+            else:
+                close_df = pd.DataFrame()
+
+        if close_df.empty:
+            return _fail("Could not extract Close price data from the downloaded result.")
+
+        close_df = close_df.dropna(axis=1, how="all")
+
+        # --- 5. Calculate return per ticker and apply filters ---
+        all_entries: List[ScreenerEntry] = []
+        for ticker in close_df.columns:
+            col = close_df[ticker].dropna()
+            if len(col) < 2:
+                continue
+
+            first_close = float(col.iloc[0])
+            last_close = float(col.iloc[-1])
+            if first_close == 0:
+                continue
+
+            total_return_pct = round(((last_close - first_close) / first_close) * 100, 4)
+            contract_code, inst = ticker_map.get(str(ticker), ("", {}))
+
+            all_entries.append({
+                "contract_code": contract_code,
+                "name": inst.get("InstrumentName", ticker) if inst else str(ticker),
+                "ticker": str(ticker),
+                "asset_group": inst.get("AssetGroup", asset_group) if inst else asset_group,
+                "asset_sub_group": inst.get("AssetSubGroup", "") if inst else "",
+                "total_return_pct": total_return_pct,
+                "first_close": round(first_close, 6),
+                "last_close": round(last_close, 6),
+                "first_date": col.index[0].strftime("%Y-%m-%d"),
+                "last_date": col.index[-1].strftime("%Y-%m-%d"),
+            })
+
+        scanned = len(all_entries)
+
+        # Apply return filters
+        matches = all_entries
+        if min_return is not None:
+            matches = [e for e in matches if e["total_return_pct"] >= min_return]
+        if max_return is not None:
+            matches = [e for e in matches if e["total_return_pct"] <= max_return]
+
+        # Sort best to worst
+        matches.sort(key=lambda e: e["total_return_pct"], reverse=True)
+
+        return {
+            "success": True,
+            "asset_group": asset_group,
+            "asset_sub_group": sub_group,
+            "period": period_str,
+            "min_return": min_return,
+            "max_return": max_return,
+            "scanned": scanned,
+            "matched": len(matches),
+            "matches": matches,
             "message": None,
         }

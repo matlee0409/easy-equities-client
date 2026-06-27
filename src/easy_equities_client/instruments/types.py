@@ -121,3 +121,29 @@ class TopMoversResult(TypedDict):
     gainers: List[TopMoverEntry]
     losers: List[TopMoverEntry]
     message: Optional[str]
+
+
+class ScreenerEntry(TypedDict):
+    contract_code: str
+    name: str
+    ticker: str
+    asset_group: str
+    asset_sub_group: str
+    total_return_pct: float
+    first_close: float
+    last_close: float
+    first_date: str
+    last_date: str
+
+
+class ScreenerResult(TypedDict):
+    success: bool
+    asset_group: str
+    asset_sub_group: Optional[str]
+    period: str
+    min_return: Optional[float]
+    max_return: Optional[float]
+    scanned: int
+    matched: int
+    matches: List[ScreenerEntry]
+    message: Optional[str]
