@@ -1,11 +1,15 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 from easy_equities_client import constants
 from easy_equities_client.instruments.types import (
     Category,
+    CompareResult,
     HistoricalPrices,
+    InstrumentComparison,
     InstrumentDetail,
+    NormalisedPoint,
     Period,
     PricePoint,
 )
@@ -350,4 +354,165 @@ class InstrumentsClient(Client):
             "period": period_str,
             "prices": prices,
             "message": None,
+        }
+
+    def compare(
+        self,
+        contract_codes: List[str],
+        period: Period = Period.ONE_YEAR,
+    ) -> CompareResult:
+        """
+        Fetch historical price data for multiple instruments in parallel and
+        normalise every series to a common base of 100 for side-by-side comparison.
+
+        Normalisation uses the **earliest date that appears in all successful
+        series** as the base date (value = 100). Every subsequent close price is
+        then expressed as a percentage of that base close::
+
+            normalised_value = (close / base_close) * 100
+
+        So a value of 110 means +10 % since the base date, and 85 means -15 %.
+
+        All network calls are made concurrently (one thread per instrument) so
+        the total wall-clock time is roughly the same as a single
+        ``historical_prices`` call regardless of how many codes are requested.
+
+        :param contract_codes: List of EasyEquities contract codes, e.g.
+            ``["EQU.US.AAPL", "EQU.US.MSFT", "EQU.ZA.SYGJP"]``.
+        :param period: Time period as a ``Period`` enum value. Default
+            ``Period.ONE_YEAR``.
+        :return: ``CompareResult`` dict containing:
+
+            - ``success``     — True if at least one instrument returned data
+            - ``period``      — the period string used
+            - ``base_date``   — date all series are indexed from (value = 100)
+            - ``dates``       — sorted union of all dates across all series
+            - ``instruments`` — list of ``InstrumentComparison`` dicts, one per
+              code, each with:
+
+              - ``contract_code``    — the requested code
+              - ``name``             — instrument name from EasyEquities
+              - ``ticker``           — Yahoo Finance ticker used
+              - ``success``          — False if no price data was available
+              - ``message``          — error detail when ``success`` is False
+              - ``prices``           — raw ``PricePoint`` list (OHLCV)
+              - ``normalised``       — ``[{"date": str, "value": float}, ...]``
+                base-100 series aligned to ``base_date``
+              - ``total_return_pct`` — percentage change from base date to last
+                data point (e.g. ``15.3`` means +15.3 %), or ``None`` on failure
+
+            - ``message``     — top-level note if no instruments succeeded
+
+        Example::
+
+            from easy_equities_client.instruments.types import Period
+
+            result = client.instruments.compare(
+                ["EQU.US.AAPL", "EQU.US.MSFT", "EQU.ZA.SYGJP"],
+                Period.ONE_YEAR,
+            )
+
+            print("Base date:", result["base_date"])
+            for inst in result["instruments"]:
+                if inst["success"]:
+                    print(
+                        inst["name"],
+                        f"total return: {inst['total_return_pct']:+.2f}%"
+                    )
+                    for point in inst["normalised"]:
+                        print(point["date"], point["value"])
+        """
+        if not contract_codes:
+            return {
+                "success": False,
+                "period": period.value if isinstance(period, Period) else str(period),
+                "base_date": None,
+                "dates": [],
+                "instruments": [],
+                "message": "No contract codes provided.",
+            }
+
+        period_str = period.value if isinstance(period, Period) else str(period)
+
+        # --- Fetch all instruments in parallel ---
+        raw_results: Dict[str, HistoricalPrices] = {}
+
+        def _fetch(code: str) -> tuple:
+            return code, self.historical_prices(code, period)
+
+        with ThreadPoolExecutor(max_workers=min(len(contract_codes), 8)) as executor:
+            futures = {executor.submit(_fetch, code): code for code in contract_codes}
+            for future in as_completed(futures):
+                code, result = future.result()
+                raw_results[code] = result
+
+        # --- Build a date→close map per successful instrument ---
+        series: Dict[str, Dict[str, float]] = {}
+        for code, result in raw_results.items():
+            if result["success"] and result["prices"]:
+                series[code] = {p["date"]: p["close"] for p in result["prices"]}
+
+        # --- Find the earliest date shared by ALL successful instruments ---
+        base_date: Optional[str] = None
+        all_dates_union: List[str] = []
+
+        if series:
+            # Each instrument's sorted date list
+            date_sets = [set(d.keys()) for d in series.values()]
+            # Intersection — dates present in every series
+            common_dates = sorted(date_sets[0].intersection(*date_sets[1:]))
+            base_date = common_dates[0] if common_dates else None
+
+            # Union of all dates for the top-level dates list
+            union: set = set()
+            for d in date_sets:
+                union |= d
+            all_dates_union = sorted(union)
+
+        # --- Normalise each series to base = 100 at base_date ---
+        def _normalise(code: str) -> List[NormalisedPoint]:
+            if code not in series or base_date is None:
+                return []
+            date_close = series[code]
+            base_close = date_close.get(base_date)
+            if not base_close:
+                return []
+            points: List[NormalisedPoint] = []
+            for date in sorted(date_close.keys()):
+                if date >= base_date:
+                    points.append({
+                        "date": date,
+                        "value": round((date_close[date] / base_close) * 100, 4),
+                    })
+            return points
+
+        # --- Assemble InstrumentComparison per code (preserve input order) ---
+        comparisons: List[InstrumentComparison] = []
+        for code in contract_codes:
+            result = raw_results[code]
+            normalised = _normalise(code)
+            total_return: Optional[float] = None
+            if normalised:
+                total_return = round(normalised[-1]["value"] - 100, 4)
+
+            inst_detail = result.get("instrument") or {}
+            comparisons.append({
+                "contract_code": code,
+                "name": inst_detail.get("InstrumentName", code) if inst_detail else code,
+                "ticker": result.get("ticker"),
+                "success": result["success"] and bool(normalised),
+                "message": result.get("message"),
+                "prices": result.get("prices", []),
+                "normalised": normalised,
+                "total_return_pct": total_return,
+            })
+
+        any_success = any(c["success"] for c in comparisons)
+        return {
+            "success": any_success,
+            "period": period_str,
+            "base_date": base_date,
+            "dates": all_dates_union,
+            "instruments": comparisons,
+            "message": None if any_success else "No price data could be fetched for any of the requested instruments.",
         }

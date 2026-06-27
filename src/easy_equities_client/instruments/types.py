@@ -74,3 +74,28 @@ class Category(TypedDict):
     asset_group: str
     asset_sub_groups: List[str]
     count: int
+
+
+class NormalisedPoint(TypedDict):
+    date: str
+    value: float
+
+
+class InstrumentComparison(TypedDict):
+    contract_code: str
+    name: str
+    ticker: Optional[str]
+    success: bool
+    message: Optional[str]
+    prices: List[PricePoint]
+    normalised: List[NormalisedPoint]
+    total_return_pct: Optional[float]
+
+
+class CompareResult(TypedDict):
+    success: bool
+    period: str
+    base_date: Optional[str]
+    dates: List[str]
+    instruments: List[InstrumentComparison]
+    message: Optional[str]
