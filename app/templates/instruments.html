@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Instruments — EasyEquities{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Instruments</h1>
+  <p class="page-subtitle">Browse and search {{ total }} instruments{% if asset_group %} in {{ asset_group }}{% endif %}</p>
+</div>
+
+<div class="section">
+  <form method="GET" class="search-form">
+    <div class="search-row">
+      <input type="text" name="q" value="{{ query }}" placeholder="Search by name, ticker or contract code..." class="search-input" />
+      <select name="group" class="search-select">
+        <option value="">All Categories</option>
+        {% for g in groups %}
+        <option value="{{ g }}" {{ 'selected' if g == asset_group else '' }}>{{ g }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn btn-primary">Search</button>
+      {% if query or asset_group %}
+      <a href="{{ url_for('instruments') }}" class="btn btn-outline">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+{% if instruments %}
+<div class="section">
+  <div class="table-wrapper">
+    <table class="table table--instruments">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Contract Code</th>
+          <th>Ticker</th>
+          <th>Exchange</th>
+          <th>Asset Group</th>
+          <th>Sub Group</th>
+          <th>Currency</th>
+          <th>Last Price</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inst in instruments %}
+        <tr>
+          <td class="inst-name">{{ inst.InstrumentName }}</td>
+          <td class="mono">{{ inst.ContractCode }}</td>
+          <td class="mono">{{ inst.ContributorSymbol }}</td>
+          <td>{{ inst.Exchange }}</td>
+          <td><span class="badge badge--blue">{{ inst.AssetGroup }}</span></td>
+          <td class="text-muted">{{ inst.AssetSubGroup }}</td>
+          <td>{{ inst.TradingCurrency }}</td>
+          <td class="mono">
+            {% if inst.LastPrice %}
+              {{ (inst.LastPrice.Value / inst.ExchangeScalingFactor)|round(2) }}
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            <a href="{{ url_for('instrument_detail', contract_code=inst.ContractCode) }}" class="btn btn-sm btn-primary">Detail</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="pagination">
+    {% if page > 1 %}
+    <a href="{{ url_for('instruments', q=query, group=asset_group, page=page-1) }}" class="btn btn-outline btn-sm">← Prev</a>
+    {% endif %}
+    <span class="pagination-info">Page {{ page }} of {{ total_pages }} ({{ total }} total)</span>
+    {% if page < total_pages %}
+    <a href="{{ url_for('instruments', q=query, group=asset_group, page=page+1) }}" class="btn btn-outline btn-sm">Next →</a>
+    {% endif %}
+  </div>
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="empty-icon">🔍</div>
+  <h3>No instruments found</h3>
+  <p>Try a different search term or category filter.</p>
+</div>
+{% endif %}
+{% endblock %}

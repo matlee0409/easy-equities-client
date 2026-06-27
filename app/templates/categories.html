@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Categories — EasyEquities{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Investment Categories</h1>
+  <p class="page-subtitle">Browse all {{ categories.values()|sum(attribute='count') }} instruments by asset group</p>
+</div>
+
+<div class="section">
+  <div class="chart-row">
+    <div class="chart-container-sm">
+      <canvas id="categoryChart"></canvas>
+    </div>
+    <div class="categories-grid">
+      {% for group, data in categories.items() %}
+      <a href="{{ url_for('instruments', group=group) }}" class="category-card">
+        <div class="category-icon">{{ {'Equities':'📊','ETFs':'🗂️','Bonds':'📜','Crypto':'₿','Unit Trusts':'🏦','Property':'🏠','ETNs':'📈','US ETFs':'🇺🇸','US ETNs':'🇺🇸'}.get(group,'💹') }}</div>
+        <div class="category-name">{{ group }}</div>
+        <div class="category-count">{{ data.count }} instruments</div>
+        {% if data.subgroups %}
+        <div class="category-subgroups">
+          {% for sg, cnt in (data.subgroups.items()|list)[:4] %}
+          <span class="subgroup-tag">{{ sg }} ({{ cnt }})</span>
+          {% endfor %}
+          {% if data.subgroups|length > 4 %}
+          <span class="subgroup-tag">+{{ data.subgroups|length - 4 }} more</span>
+          {% endif %}
+        </div>
+        {% endif %}
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<script>
+const cats = {{ categories|tojson }};
+const labels = Object.keys(cats);
+const values = labels.map(k => cats[k].count);
+const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316','#84cc16','#ec4899'];
+const ctx = document.getElementById('categoryChart').getContext('2d');
+new Chart(ctx, {
+  type: 'doughnut',
+  data: {
+    labels,
+    datasets: [{
+      data: values,
+      backgroundColor: colors.slice(0, labels.length),
+      borderWidth: 2,
+      borderColor: '#1e293b',
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: { position: 'bottom', labels: { color: '#cbd5e1', padding: 12, font: { size: 12 } } },
+      tooltip: {
+        callbacks: { label: ctx => ` ${ctx.label}: ${ctx.parsed} instruments` }
+      }
+    }
+  }
+});
+</script>
+{% endblock %}
