@@ -1,5 +1,9 @@
-import shutil
-from urllib.parse import urlparse
+import base64
+import hashlib
+import os
+import re
+import urllib.parse
+from typing import Optional
 
 from requests import Session
 
@@ -8,160 +12,220 @@ from easy_equities_client.accounts.clients import AccountsClient
 from easy_equities_client.instruments.clients import InstrumentsClient
 from easy_equities_client.types import Client
 
-_CHROMIUM_ARGS = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--headless=new",
-]
+_CLIENT_ID = "fa4d2622bc1e45a7be79395d941e2548"
+_REDIRECT_URI = "https://portfolio-overview.apps.easyequities.io/auth/callback"
+_SCOPES = (
+    "openid platform profile api_gateway user_profile_api static_data_api "
+    "easy_protect_api easy_lending_api thrive_api easy_trader_api portfolio_api "
+    "auto_refica_api registration_api easy_loyalty_api transaction_history_provider_api"
+)
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def _find_chromium() -> str:
-    """Return the path to a usable Chromium/Chrome binary."""
-    for candidate in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
-        path = shutil.which(candidate)
-        if path:
-            return path
-    raise RuntimeError(
-        "No Chromium/Chrome binary found. "
-        "Install Chromium (e.g. via system packages) before using this client."
-    )
+def _pkce_pair() -> tuple[str, str]:
+    """Generate a PKCE code_verifier and its S256 code_challenge."""
+    code_verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return code_verifier, code_challenge
+
+
+def _random_token(n: int = 32) -> str:
+    return base64.urlsafe_b64encode(os.urandom(n)).rstrip(b"=").decode()
 
 
 class PlatformClient(Client):
     """
     Generic client for EasyEquities / Satrix platforms.
 
-    Authentication uses the OpenID Connect / OAuth2 PKCE flow via
-    identity.openeasy.io. Because the identity server employs JavaScript-based
-    bot detection, login is performed via a headless Chromium browser
-    (Playwright). After a successful login the Bearer token and session cookies
-    are transferred to a regular requests.Session so that all subsequent calls
-    are lightweight HTTP requests.
+    Authentication uses a direct HTTP implementation of the OAuth2 PKCE flow
+    against identity.openeasy.io — no browser or Playwright required.
+    After a successful login the Bearer token is stored in the session headers
+    so that all subsequent calls are lightweight authenticated HTTP requests.
     """
 
-    def __init__(self, base_url, session: Session = None):
+    def __init__(self, base_url: str, session: Session = None):
         super().__init__(base_url, session)
         self.accounts = AccountsClient(base_url, self.session)
         self.instruments = InstrumentsClient(base_url, self.session)
 
     def login(self, username: str, password: str) -> bool:
         """
-        Login to the platform using a headless browser to complete the OAuth2
-        PKCE flow, then transfer the Bearer token and session cookies to the
-        underlying requests.Session.
+        Login via direct HTTP — no browser required.
 
-        Flow:
-          1. Open platform /Account/SignIn in headless Chromium — platform
-             generates a PKCE code_verifier/challenge and stores it in its
-             own session, then redirects to the identity server login page.
-          2. Fill in username and click "Continue" (two-step UI).
-          3. Fill in password and click "Login".
-          4. Wait for the OAuth2 callback to complete and the browser to
-             land on the EasyEquities portfolio page.
-          5. Capture the Bearer JWT from the first REST API request the SPA
-             makes to rest.synatic.openeasy.io.
-          6. Copy all browser cookies + the Bearer token into the
-             requests.Session so subsequent HTTP calls are authenticated.
+        Implements the OAuth2 PKCE flow:
+          1. Generate PKCE code_verifier / code_challenge.
+          2. GET /connect/authorize — identity server stores the PKCE state
+             and redirects to its own login page (we follow the redirect to
+             get the anti-forgery token and ReturnUrl).
+          3. POST username to /Account/Login (first step of the two-step UI).
+          4. POST password to /Account/Login (second step).
+          5. Follow the redirect chain back to the platform callback URL,
+             which contains the authorization code.
+          6. POST to /connect/token to exchange the code for a Bearer JWT.
+          7. Store the Bearer token in the requests.Session headers.
 
-        :param username: EasyEquities / Satrix username.
-        :param password: EasyEquities / Satrix password.
+        :param username: EasyEquities username.
+        :param password: EasyEquities password.
         :return: True if successfully logged in.
-        :raises RuntimeError: if Chromium is not found.
-        :raises Exception: if login fails or times out.
+        :raises Exception: if login fails (wrong credentials, bot block, etc.).
         """
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        s = self.session
+        s.headers.update({"User-Agent": _USER_AGENT})
 
-        chromium_path = _find_chromium()
+        # --- Step 1: Generate PKCE pair ---
+        code_verifier, code_challenge = _pkce_pair()
+        nonce = _random_token(24)
+        state = _random_token(24)
 
-        bearer_token: list[str] = []
+        # --- Step 2: Hit /connect/authorize to start the PKCE flow ---
+        auth_params = {
+            "client_id": _CLIENT_ID,
+            "redirect_uri": _REDIRECT_URI,
+            "response_type": "code",
+            "scope": _SCOPES,
+            "nonce": nonce,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        auth_url = constants.IDENTITY_BASE_URL + "/connect/authorize"
+        r = s.get(auth_url, params=auth_params, allow_redirects=True)
+        if r.status_code not in (200, 302):
+            raise Exception(f"Authorize step failed: HTTP {r.status_code}")
 
-        def _capture_token(request) -> None:
-            if "rest.synatic.openeasy.io" in request.url and not bearer_token:
-                auth = request.headers.get("authorization", "")
-                if auth.startswith("Bearer "):
-                    bearer_token.append(auth)
+        login_page_url = r.url
+        login_page_body = r.text
 
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                executable_path=chromium_path,
-                args=_CHROMIUM_ARGS,
-                headless=True,
+        # Extract the anti-forgery token and ReturnUrl from the login page
+        csrf_match = re.search(
+            r'<input name="__RequestVerificationToken"[^>]+value="([^"]+)"',
+            login_page_body,
+        )
+        return_url_match = re.search(
+            r'<input[^>]+name="ReturnUrl"[^>]+value="([^"]+)"',
+            login_page_body,
+        )
+        if not csrf_match:
+            raise Exception(
+                "Could not find anti-forgery token on the login page. "
+                "EasyEquities may have updated their login flow or is blocking requests."
             )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
+
+        csrf_token = csrf_match.group(1)
+        return_url = (
+            html_unescape(return_url_match.group(1)) if return_url_match else ""
+        )
+
+        # --- Step 3: POST credentials in one request ---
+        # The two-step UI (username then password) is pure JavaScript — the
+        # "Continue" button just reveals the password field client-side.
+        # The actual form submission sends username + password together in
+        # a single POST with IsUsernameProvided=False.
+        identity_login_url = constants.IDENTITY_BASE_URL + constants.IDENTITY_SIGN_IN_PATH
+        login_data = {
+            "__RequestVerificationToken": csrf_token,
+            "ReturnUrl": return_url,
+            "ClientIdForProperties": _CLIENT_ID,
+            "Username": username,
+            "IsUsernameProvided": "False",
+            "Password": password,
+            "button": "login",
+            "Response": "",
+        }
+        r3 = s.post(
+            identity_login_url,
+            data=login_data,
+            headers={"Referer": login_page_url},
+            allow_redirects=False,
+        )
+
+        # --- Step 5: Follow redirects to the callback URL ---
+        # After a successful password POST the server redirects back to the
+        # platform callback with ?code=...&state=...
+        auth_code: Optional[str] = None
+        redirect_url = r3.headers.get("Location", "")
+
+        if not redirect_url:
+            # Check if we're still on the login page (bad password)
+            body3 = r3.text
+            error_el = re.search(
+                r'id="error-message-container"[^>]*>(.*?)</div>',
+                body3,
+                re.DOTALL,
             )
-            page = context.new_page()
-            page.on("request", _capture_token)
+            error_msg = error_el.group(1).strip() if error_el else ""
+            raise Exception(
+                "Login failed — no redirect after password submission. "
+                + (f"Server message: {error_msg}" if error_msg else
+                   "Check your username and password.")
+            )
 
-            try:
-                # Step 1: Navigate to platform sign-in (triggers PKCE + redirect to identity server)
-                page.goto(
-                    self._url(constants.PLATFORM_SIGN_IN_PATH),
-                    wait_until="networkidle",
-                    timeout=30_000,
-                )
+        # Follow redirects until we reach the callback or find the code
+        max_redirects = 10
+        current_url = redirect_url
+        for _ in range(max_redirects):
+            parsed = urllib.parse.urlparse(current_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if "code" in params:
+                auth_code = params["code"][0]
+                break
 
-                # Step 2: Fill username and click Continue (two-step login UI)
-                page.fill('input[name="Username"]', username)
-                page.click('#continueButton')
+            if not current_url.startswith("http"):
+                current_url = constants.IDENTITY_BASE_URL + current_url
 
-                # Step 3: Wait for password field, fill it in
-                page.wait_for_selector('input[name="Password"]:visible', timeout=10_000)
-                page.fill('input[name="Password"]', password)
+            r_step = s.get(current_url, allow_redirects=False)
+            next_loc = r_step.headers.get("Location", "")
+            if not next_loc:
+                break
+            current_url = next_loc
 
-                # Step 4: Submit and wait for the portfolio page
-                page.click('#SignIn')
+        if not auth_code:
+            raise Exception(
+                "OAuth2 flow did not return an authorization code. "
+                "EasyEquities may be blocking automated logins."
+            )
 
-                try:
-                    page.wait_for_url("**easyequities.io/**", timeout=20_000)
-                    page.wait_for_function(
-                        "() => !window.location.pathname.includes('/auth/callback') "
-                        "&& !window.location.host.includes('identity')",
-                        timeout=15_000,
-                    )
-                    # Let the SPA fire its initial API calls so we can capture the token
-                    page.wait_for_load_state("networkidle", timeout=15_000)
-                except PWTimeout:
-                    current_url = page.url
-                    if "identity" in current_url or "login" in current_url.lower():
-                        error_el = page.query_selector('[id="error-message-container"]')
-                        error_msg = error_el.inner_text().strip() if error_el else ""
-                        raise Exception(
-                            "Login failed — still on the identity server page. "
-                            + (f"Server message: {error_msg}" if error_msg else
-                               "Check your username and password.")
-                        )
-                    raise
+        # --- Step 6: Exchange code for Bearer token ---
+        token_data = {
+            "grant_type": "authorization_code",
+            "client_id": _CLIENT_ID,
+            "code": auth_code,
+            "redirect_uri": _REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }
+        r_token = s.post(
+            constants.IDENTITY_BASE_URL + "/connect/token",
+            data=token_data,
+        )
+        if r_token.status_code != 200:
+            raise Exception(
+                f"Token exchange failed: HTTP {r_token.status_code} — {r_token.text[:200]}"
+            )
 
-                # Step 5: Transfer cookies and Bearer token to the requests.Session
-                for cookie in context.cookies():
-                    self.session.cookies.set(
-                        cookie["name"],
-                        cookie["value"],
-                        domain=cookie.get("domain", "").lstrip("."),
-                    )
+        token_json = r_token.json()
+        access_token = token_json.get("access_token")
+        if not access_token:
+            raise Exception(f"No access_token in token response: {token_json}")
 
-                if bearer_token:
-                    self.session.headers["Authorization"] = bearer_token[0]
-
-            finally:
-                context.close()
-                browser.close()
-
+        # --- Step 7: Store Bearer token in session ---
+        s.headers["Authorization"] = f"Bearer {access_token}"
         return True
+
+
+def html_unescape(s: str) -> str:
+    """Unescape HTML entities in a string (e.g. &#x2F; -> /)."""
+    import html
+    return html.unescape(s)
 
 
 class EasyEquitiesClient(PlatformClient):
     """
     Client to interact with EasyEquities.
-    Sign-in starts at https://platform.easyequities.io/Account/SignIn which
-    redirects through the OAuth2 flow and lands on
-    https://portfolio-overview.apps.easyequities.io.
     """
 
     def __init__(self, base_url: str = constants.EASY_EQUITIES_BASE_PLATFORM_URL):
