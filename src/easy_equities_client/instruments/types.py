@@ -147,3 +147,18 @@ class ScreenerResult(TypedDict):
     matched: int
     matches: List[ScreenerEntry]
     message: Optional[str]
+
+
+class SearchMatch(TypedDict):
+    contract_code: str
+    name: str
+    ticker: str
+    asset_group: str
+    asset_sub_group: str
+    score: float
+
+
+class SearchResult(TypedDict):
+    query: str
+    total: int
+    results: List[SearchMatch]

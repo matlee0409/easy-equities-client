@@ -14,6 +14,8 @@ from easy_equities_client.instruments.types import (
     PricePoint,
     ScreenerEntry,
     ScreenerResult,
+    SearchMatch,
+    SearchResult,
     TopMoverEntry,
     TopMoversResult,
 )
@@ -1025,4 +1027,136 @@ class InstrumentsClient(Client):
             "matched": len(matches),
             "matches": matches,
             "message": None,
+        }
+
+    def search(
+        self,
+        query: str,
+        asset_group: Optional[str] = None,
+        top: int = 10,
+    ) -> SearchResult:
+        """
+        Search all EasyEquities instruments by name or contract code using
+        fuzzy matching. No external dependencies — uses Python's built-in
+        ``difflib``.
+
+        Scoring rules (applied to both the instrument name and contract code,
+        best score wins):
+
+        1. **Exact match** (case-insensitive) → 1.0
+        2. **Starts-with** → 0.9
+        3. **Contains** (whole query as substring) → 0.75
+        4. **Token overlap** — fraction of query words found in the name → up
+           to 0.7 (scaled by coverage)
+        5. **difflib fuzzy ratio** → up to 0.6 (scaled)
+
+        Results are deduplicated by contract code, filtered to ``score > 0``,
+        and returned sorted best-first.
+
+        :param query: Free-text search string. Examples: ``"Tesla"``,
+            ``"TSLA"``, ``"ARK"``, ``"Satrix S&P 500"``.
+        :param asset_group: Optional filter to limit results to one asset group,
+            e.g. ``"US ETFs"`` or ``"Equities"``. Default ``None`` (all groups).
+        :param top: Maximum number of results to return. Default ``10``.
+        :return: ``SearchResult`` dict:
+
+            - ``query``   — original query string
+            - ``total``   — number of matches returned
+            - ``results`` — list of ``SearchMatch`` dicts, sorted best-first
+
+            Each ``SearchMatch`` contains:
+            ``contract_code``, ``name``, ``ticker``, ``asset_group``,
+            ``asset_sub_group``, ``score`` (0–1, higher = better match).
+
+        Examples::
+
+            hits = client.instruments.search("Tesla")
+            for h in hits["results"]:
+                print(h["score"], h["name"], h["ticker"])
+
+            # Limit to a specific asset group
+            hits = client.instruments.search("ARK", asset_group="US ETFs")
+
+            # Get the contract code for a known ticker
+            hits = client.instruments.search("NVDA")
+            code = hits["results"][0]["contract_code"]
+        """
+        import difflib
+
+        q = query.strip()
+        q_lower = q.lower()
+        q_tokens = q_lower.split()
+
+        def _score(text: str) -> float:
+            t = text.lower()
+            # 1. Exact
+            if t == q_lower:
+                return 1.0
+            # 2. Starts-with
+            if t.startswith(q_lower):
+                return 0.9
+            # 3. Contains substring
+            if q_lower in t:
+                return 0.75
+            # 4. Token overlap
+            if q_tokens:
+                hit_count = sum(1 for tok in q_tokens if tok in t)
+                if hit_count:
+                    coverage = hit_count / len(q_tokens)
+                    return 0.4 + 0.3 * coverage
+            # 5. difflib fuzzy
+            ratio = difflib.SequenceMatcher(None, q_lower, t).ratio()
+            if ratio > 0.4:
+                return ratio * 0.6
+            return 0.0
+
+        all_instruments = self._fetch_all_instruments()
+
+        # Optionally restrict to one asset group
+        if asset_group:
+            all_instruments = [
+                i for i in all_instruments
+                if i.get("AssetGroup") == asset_group
+            ]
+
+        # Deduplicate by contract code
+        seen: set = set()
+        unique: List[InstrumentDetail] = []
+        for inst in all_instruments:
+            code = inst.get("ContractCode", "")
+            if code and code not in seen:
+                seen.add(code)
+                unique.append(inst)
+
+        scored: List[SearchMatch] = []
+        for inst in unique:
+            name = inst.get("InstrumentName", "")
+            code = inst.get("ContractCode", "")
+            ticker = _resolve_yahoo_ticker(inst)
+
+            # Score against name, contract code, and Yahoo ticker — take best
+            best = max(
+                _score(name),
+                _score(code),
+                _score(ticker) if ticker else 0.0,
+            )
+            if best <= 0.0:
+                continue
+
+            scored.append({
+                "contract_code": code,
+                "name": name,
+                "ticker": ticker or "",
+                "asset_group": inst.get("AssetGroup", ""),
+                "asset_sub_group": inst.get("AssetSubGroup", ""),
+                "score": round(best, 4),
+            })
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        results = scored[:top]
+
+        return {
+            "query": q,
+            "total": len(results),
+            "results": results,
         }
