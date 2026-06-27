@@ -13,11 +13,10 @@ class Platform(CustomEnum):
 
 
 # --- Platform frontend URLs ---
-# The old platform.easyequities.io now redirects to portfolio-overview.apps.easyequities.io.
 EASY_EQUITIES_BASE_PLATFORM_URL = "https://portfolio-overview.apps.easyequities.io"
 SATRIX_BASE_PLATFORM_URL = "https://platform.satrixnow.co.za"
 
-# Sign-in entry point — still used to start the OAuth2 PKCE flow.
+# Sign-in entry point
 PLATFORM_SIGN_IN_PATH = "/Account/SignIn"
 
 # --- Identity server (OAuth2/OIDC provider) ---
@@ -25,14 +24,19 @@ IDENTITY_BASE_URL = "https://identity.openeasy.io"
 IDENTITY_SIGN_IN_PATH = "/Account/Login"
 IDENTITY_OAUTH_CALLBACK_PATH = "/connect/authorize/callback"
 
-# --- REST API (new platform backend, replaces old HTML-scraped endpoints) ---
+# --- REST API (rest.synatic.openeasy.io) ---
 REST_API_BASE_URL = "https://rest.synatic.openeasy.io/easyequities"
 REST_PORTFOLIO_OVERVIEW_PATH = "/portfolios/v3/portfolio-overview"
 REST_NAV_CHART_PATH = "/portfolios/nav_chart_data/{period}"
-REST_TRANSACTIONS_PATH = "/portfolios/transactions"
+REST_INVESTNOW_INSTRUMENTS_PATH = "/investnow/instruments"
 
-# --- Legacy constants (kept for backward compatibility with existing tests) ---
-# These endpoints no longer respond correctly on the live platform.
+# --- API Gateway (apigateway.openeasy.io) ---
+API_GATEWAY_BASE_URL = "https://apigateway.openeasy.io"
+API_GW_TRANSACTIONS_PATH = "/transaction-history-provider/api/v1/transactions"
+API_GW_EASYTRADER_TRANSACTIONS_PATH = "/easytrader/api/TransactionHistory/transactions"
+
+# --- Legacy constants (kept for backward compatibility) ---
+REST_TRANSACTIONS_PATH = "/portfolios/transactions"
 PLATFORM_ACCOUNT_OVERVIEW_PATH = "/AccountOverview"
 PLATFORM_CAN_USE_ACCOUNT_PATH = "/Menu/CanUseSelectedAccount"
 PLATFORM_UPDATE_CURRENCY_PATH = "/Menu/UpdateCurrency"

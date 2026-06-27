@@ -17,6 +17,13 @@ from easy_equities_client.types import Client
 
 logger = logging.getLogger(__name__)
 
+_API_GW_TRANSACTION_PATHS = [
+    "/transaction-history-provider/api/v1/transactions",
+    "/transaction-history-provider/v1/transactions",
+    "/easytrader/api/TransactionHistory/transactions",
+    "/easytrader/api/Transactions/account-transactions",
+]
+
 
 class AccountsClient(Client):
     def __init__(self, base_url: str = "", session: Session = None):
@@ -24,10 +31,7 @@ class AccountsClient(Client):
         self._portfolio_cache: Optional[Dict] = None
 
     def _get_portfolio_overview(self, force_refresh: bool = False) -> Dict:
-        """
-        Fetch and cache the REST API portfolio overview.
-        Returns the full response dict from /portfolios/v3/portfolio-overview.
-        """
+        """Fetch and cache the REST API portfolio overview."""
         if self._portfolio_cache is None or force_refresh:
             response = self.session.get(
                 constants.REST_API_BASE_URL + constants.REST_PORTFOLIO_OVERVIEW_PATH
@@ -67,10 +71,9 @@ class AccountsClient(Client):
 
     def valuations(self, account_id: str) -> Valuation:
         """
-        Return valuation data for the given account.
+        Return valuation data for the given account from the REST API portfolio overview.
 
-        Returns a dict with keys mapped from the REST API portfolio overview
-        response for the matching account.
+        :param account_id: Account number string (e.g. 'EE3237137-15547214').
         """
         self._portfolio_cache = None
         acc = self._find_account(account_id)
@@ -87,7 +90,6 @@ class AccountsClient(Client):
         managers = next(
             (a for a in aggregates if a.get("aggregateName") == "Manager"), {}
         )
-
         income_accruals = next(
             (a for a in accruals if a.get("accrualName") == "Income"), {}
         )
@@ -112,43 +114,96 @@ class AccountsClient(Client):
 
     def transactions(self, account_id: str) -> List[Transaction]:
         """
-        Gets transactions for the given account via the REST API.
+        Fetch transactions for the given account.
+
+        Tries multiple known API Gateway transaction endpoints. Returns an empty
+        list if the account has no transactions or the endpoint is unavailable.
+
+        :param account_id: Account number string (e.g. 'EE3237137-15547214').
         """
-        url = (
-            constants.REST_API_BASE_URL
-            + constants.REST_TRANSACTIONS_PATH
-            + f"?accountNumber={account_id}"
+        gw = constants.API_GATEWAY_BASE_URL
+        headers = {
+            "Origin": "https://portfolio-overview.apps.easyequities.io",
+            "Referer": "https://portfolio-overview.apps.easyequities.io/",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        for path in _API_GW_TRANSACTION_PATHS:
+            url = gw + path
+            params = {"accountNumber": account_id}
+            try:
+                r = self.session.get(url, params=params, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    logger.info(f"Transactions fetched from {path}: {len(data)} records")
+                    return data if isinstance(data, list) else data.get("transactions", [])
+                elif r.status_code == 404:
+                    # Empty result set — account exists but no transactions
+                    logger.debug(f"No transactions at {path} (404)")
+                    return []
+                else:
+                    logger.debug(f"Transaction endpoint {path} returned {r.status_code}")
+            except Exception as exc:
+                logger.debug(f"Transaction endpoint {path} error: {exc}")
+
+        # No endpoint worked — return empty list with a warning
+        logger.warning(
+            f"Could not fetch transactions for account '{account_id}'. "
+            "The transaction history API endpoint may have changed. "
+            "Check constants.API_GW_TRANSACTIONS_PATH for the latest URL."
         )
-        response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
+        return []
 
     def transactions_for_period(
         self, account_id: str, start_date: date, end_date: date
     ) -> List[TransactionForPeriod]:
         """
-        Gets transactions for a given period via the REST API.
+        Fetch transactions for a given date range.
 
-        Returns transactions ordered in reverse chronological order (newest to oldest).
+        :param account_id: Account number string.
+        :param start_date: Start of the period (inclusive).
+        :param end_date: End of the period (inclusive).
         """
+        gw = constants.API_GATEWAY_BASE_URL
+        headers = {
+            "Origin": "https://portfolio-overview.apps.easyequities.io",
+            "Referer": "https://portfolio-overview.apps.easyequities.io/",
+            "Accept": "application/json, text/plain, */*",
+        }
         transactions: List[Any] = []
-
         current_start = start_date
         current_end = min(end_date, current_start + timedelta(days=90))
 
-        while current_start < end_date:
-            logger.debug(f"Current start: {current_start}, Current end: {current_end}")
+        while current_start <= end_date:
+            logger.debug(f"Fetching transactions {current_start} → {current_end}")
+            fetched = False
 
-            url = (
-                constants.REST_API_BASE_URL
-                + constants.REST_TRANSACTIONS_PATH
-                + f"?accountNumber={account_id}"
-                f"&startDate={current_start.isoformat()}"
-                f"&endDate={current_end.isoformat()}"
-            )
-            response = self.session.get(url)
-            new_transactions = response.json() if response.status_code == 200 else []
-            transactions = list(new_transactions) + transactions
+            for path in _API_GW_TRANSACTION_PATHS:
+                url = gw + path
+                params = {
+                    "accountNumber": account_id,
+                    "startDate": current_start.isoformat(),
+                    "endDate": current_end.isoformat(),
+                }
+                try:
+                    r = self.session.get(url, params=params, headers=headers, timeout=15)
+                    if r.status_code == 200:
+                        batch = r.json()
+                        if isinstance(batch, list):
+                            transactions = batch + transactions
+                        fetched = True
+                        break
+                    elif r.status_code == 404:
+                        fetched = True
+                        break
+                except Exception as exc:
+                    logger.debug(f"transactions_for_period error at {path}: {exc}")
+
+            if not fetched:
+                logger.warning(
+                    f"Could not fetch transactions for period {current_start}–{current_end}. "
+                    "Transaction API endpoint may have changed."
+                )
 
             current_start = current_end + timedelta(days=1)
             current_end = min(end_date, current_start + timedelta(days=90))
@@ -157,10 +212,10 @@ class AccountsClient(Client):
 
     def holdings(self, account_id: str, include_shares: bool = False) -> List[Holding]:
         """
-        Get an account's holdings/stocks from the REST API portfolio overview.
+        Get an account's holdings from the REST API portfolio overview.
 
-        :param account_id: String account ID (accountNumber).
-        :param include_shares: Included for backward compatibility; shares data is
+        :param account_id: Account number string (e.g. 'EE3237137-15547214').
+        :param include_shares: Included for backward compatibility; share units are
             already present in the REST API response as 'units'.
         """
         self._portfolio_cache = None
@@ -168,8 +223,8 @@ class AccountsClient(Client):
         if acc is None:
             raise ValueError(f"Account '{account_id}' not found in portfolio overview.")
 
-        holdings: List[Holding] = []
         currency = acc.get("currencyCode", "")
+        holdings: List[Holding] = []
 
         for asset in acc.get("assets", []):
             image_uri = asset.get("imageUri", "")
