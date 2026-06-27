@@ -160,8 +160,16 @@ name = "easy-equities-client"
 version = "1.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "beautifulsoup4" },
     { name = "bs4" },
+    { name = "lxml" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-mock" },
     { name = "requests" },
+    { name = "requests-mock" },
+    { name = "ruff" },
 ]
 
 [package.dev-dependencies]
@@ -177,8 +185,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "bs4", specifier = ">=0.0.2" },
+    { name = "lxml", specifier = ">=6.0.2" },
+    { name = "mypy", specifier = ">=1.19.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "pytest-mock", specifier = ">=3.15.1" },
     { name = "requests", specifier = ">=2.32.5" },
+    { name = "requests-mock", specifier = ">=1.12.1" },
+    { name = "ruff", specifier = ">=0.15.5" },
 ]
 
 [package.metadata.requires-dev]
