@@ -12,6 +12,8 @@ from easy_equities_client.instruments.types import (
     NormalisedPoint,
     Period,
     PricePoint,
+    TopMoverEntry,
+    TopMoversResult,
 )
 from easy_equities_client.types import Client
 
@@ -515,4 +517,260 @@ class InstrumentsClient(Client):
             "dates": all_dates_union,
             "instruments": comparisons,
             "message": None if any_success else "No price data could be fetched for any of the requested instruments.",
+        }
+
+    def top_movers(
+        self,
+        asset_group: str = "Equities",
+        period: Period = Period.ONE_MONTH,
+        n: int = 10,
+        scan_limit: int = 200,
+    ) -> TopMoversResult:
+        """
+        Rank instruments in an asset group by total return over a period and
+        return the top N gainers and bottom N losers.
+
+        All price data is fetched in a **single batch** ``yfinance.download()``
+        call, so scanning hundreds of tickers takes roughly the same time as
+        fetching one.
+
+        Instruments are deduplicated by contract code before scanning. When the
+        group contains more unique instruments than ``scan_limit``, the set is
+        randomly sampled so the call stays responsive.
+
+        :param asset_group: EasyEquities asset group to scan. One of:
+            ``"Equities"``, ``"ETFs"``, ``"US ETFs"``, ``"Bonds"``,
+            ``"Crypto"``, ``"Unit Trusts"``, ``"ETNs"``, ``"US ETNs"``,
+            ``"Property"``. Default ``"Equities"``.
+        :param period: Time period as a ``Period`` enum. Default
+            ``Period.ONE_MONTH``.
+        :param n: Number of top gainers **and** losers to return.
+            Default ``10``.
+        :param scan_limit: Maximum number of instruments to scan. When the
+            group is larger than this the selection is sampled at random.
+            Default ``200``. Raise to scan more; lower to return faster.
+        :return: ``TopMoversResult`` dict containing:
+
+            - ``success``     — True if any return data was obtained
+            - ``asset_group`` — the group that was scanned
+            - ``period``      — the period used
+            - ``scanned``     — number of instruments actually fetched
+            - ``gainers``     — list of up to N ``TopMoverEntry`` dicts,
+              best performer first
+            - ``losers``      — list of up to N ``TopMoverEntry`` dicts,
+              worst performer first
+            - ``message``     — error detail when ``success`` is False
+
+            Each ``TopMoverEntry`` contains:
+            ``contract_code``, ``name``, ``ticker``, ``asset_sub_group``,
+            ``total_return_pct``, ``first_close``, ``last_close``,
+            ``first_date``, ``last_date``.
+
+        Example::
+
+            from easy_equities_client.instruments.types import Period
+
+            movers = client.instruments.top_movers(
+                asset_group="US ETFs",
+                period=Period.THREE_MONTHS,
+                n=5,
+            )
+            print("Top gainers:")
+            for g in movers["gainers"]:
+                print(f"  {g['name']:40s}  {g['total_return_pct']:+.2f}%")
+
+            print("Top losers:")
+            for l in movers["losers"]:
+                print(f"  {l['name']:40s}  {l['total_return_pct']:+.2f}%")
+        """
+        try:
+            import random
+            import yfinance as yf
+        except ImportError:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period.value if isinstance(period, Period) else str(period),
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": "yfinance is not installed. Install it with: pip install yfinance",
+            }
+
+        period_str = period.value if isinstance(period, Period) else str(period)
+        yf_period = _PERIOD_MAP.get(period, period_str) if isinstance(period, Period) else period_str
+
+        # --- 1. Fetch and deduplicate instruments for the group ---
+        all_instruments = self._fetch_all_instruments()
+        group_instruments = [
+            i for i in all_instruments if i.get("AssetGroup") == asset_group
+        ]
+        # Deduplicate by contract code, keeping the first occurrence
+        seen_codes: set = set()
+        unique_instruments: List[InstrumentDetail] = []
+        for inst in group_instruments:
+            code = inst.get("ContractCode", "")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                unique_instruments.append(inst)
+
+        if not unique_instruments:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": (
+                    f"No instruments found for asset group '{asset_group}'. "
+                    f"Valid groups: Equities, ETFs, US ETFs, Bonds, Crypto, "
+                    f"Unit Trusts, ETNs, US ETNs, Property."
+                ),
+            }
+
+        # Sample if the group is larger than scan_limit
+        if len(unique_instruments) > scan_limit:
+            logger.info(
+                f"top_movers: {len(unique_instruments)} unique instruments in '{asset_group}', "
+                f"sampling {scan_limit}."
+            )
+            unique_instruments = random.sample(unique_instruments, scan_limit)
+
+        # --- 2. Resolve Yahoo Finance tickers ---
+        # ticker → (contract_code, instrument)
+        ticker_map: Dict[str, tuple] = {}
+        for inst in unique_instruments:
+            ticker = _resolve_yahoo_ticker(inst)
+            if ticker:
+                ticker_map[ticker] = (inst.get("ContractCode", ""), inst)
+
+        tickers = list(ticker_map.keys())
+
+        if not tickers:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": "Could not resolve any Yahoo Finance tickers for this asset group.",
+            }
+
+        # --- 3. Batch-download all tickers in one call ---
+        logger.debug(f"top_movers: batch-downloading {len(tickers)} tickers (period={yf_period})")
+        try:
+            raw = yf.download(
+                tickers=tickers,
+                period=yf_period,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+        except Exception as exc:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": f"yfinance batch download failed: {exc}",
+            }
+
+        if raw.empty:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": "No price data returned by Yahoo Finance for any ticker in this group.",
+            }
+
+        # --- 4. Extract Close prices — handle single vs. multi ticker layout ---
+        import pandas as pd
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            # Multi-ticker: columns are (metric, ticker)
+            close_df = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+        else:
+            # Single ticker: columns are plain metric names
+            if "Close" in raw.columns:
+                close_df = raw[["Close"]].rename(columns={"Close": tickers[0]})
+            else:
+                close_df = pd.DataFrame()
+
+        if close_df.empty:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": 0,
+                "gainers": [],
+                "losers": [],
+                "message": "Could not extract Close price data from the downloaded result.",
+            }
+
+        # Drop columns (tickers) that are entirely NaN
+        close_df = close_df.dropna(axis=1, how="all")
+
+        # --- 5. Calculate total return per ticker ---
+        entries: List[TopMoverEntry] = []
+        for ticker in close_df.columns:
+            col = close_df[ticker].dropna()
+            if len(col) < 2:
+                continue
+
+            first_close = float(col.iloc[0])
+            last_close = float(col.iloc[-1])
+            if first_close == 0:
+                continue
+
+            total_return_pct = round(((last_close - first_close) / first_close) * 100, 4)
+            contract_code, inst = ticker_map.get(str(ticker), ("", {}))
+            first_date = col.index[0].strftime("%Y-%m-%d")
+            last_date = col.index[-1].strftime("%Y-%m-%d")
+
+            entries.append({
+                "contract_code": contract_code,
+                "name": inst.get("InstrumentName", ticker) if inst else str(ticker),
+                "ticker": str(ticker),
+                "asset_sub_group": inst.get("AssetSubGroup", "") if inst else "",
+                "total_return_pct": total_return_pct,
+                "first_close": round(first_close, 6),
+                "last_close": round(last_close, 6),
+                "first_date": first_date,
+                "last_date": last_date,
+            })
+
+        if not entries:
+            return {
+                "success": False,
+                "asset_group": asset_group,
+                "period": period_str,
+                "scanned": len(tickers),
+                "gainers": [],
+                "losers": [],
+                "message": (
+                    "Price data was downloaded but no instruments had enough "
+                    "data points to calculate a return."
+                ),
+            }
+
+        # --- 6. Sort and slice ---
+        entries.sort(key=lambda e: e["total_return_pct"], reverse=True)
+        gainers = entries[:n]
+        losers = list(reversed(entries[-n:]))  # worst first
+
+        return {
+            "success": True,
+            "asset_group": asset_group,
+            "period": period_str,
+            "scanned": len(entries),
+            "gainers": gainers,
+            "losers": losers,
+            "message": None,
         }

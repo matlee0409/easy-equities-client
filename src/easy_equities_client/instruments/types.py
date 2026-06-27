@@ -99,3 +99,25 @@ class CompareResult(TypedDict):
     dates: List[str]
     instruments: List[InstrumentComparison]
     message: Optional[str]
+
+
+class TopMoverEntry(TypedDict):
+    contract_code: str
+    name: str
+    ticker: str
+    asset_sub_group: str
+    total_return_pct: float
+    first_close: float
+    last_close: float
+    first_date: str
+    last_date: str
+
+
+class TopMoversResult(TypedDict):
+    success: bool
+    asset_group: str
+    period: str
+    scanned: int
+    gainers: List[TopMoverEntry]
+    losers: List[TopMoverEntry]
+    message: Optional[str]
