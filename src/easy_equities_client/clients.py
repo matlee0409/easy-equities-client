@@ -10,6 +10,7 @@ from requests import Session
 from easy_equities_client import constants
 from easy_equities_client.accounts.clients import AccountsClient
 from easy_equities_client.instruments.clients import InstrumentsClient
+from easy_equities_client.orders.clients import OrdersClient
 from easy_equities_client.types import Client
 
 _CLIENT_ID = "fa4d2622bc1e45a7be79395d941e2548"
@@ -52,6 +53,7 @@ class PlatformClient(Client):
         super().__init__(base_url, session)
         self.accounts = AccountsClient(base_url, self.session)
         self.instruments = InstrumentsClient(base_url, self.session)
+        self.orders = OrdersClient(base_url, self.session)
 
     def login(self, username: str, password: str) -> bool:
         """

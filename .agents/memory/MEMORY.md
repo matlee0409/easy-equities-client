@@ -1,0 +1,1 @@
+- [EasyEquities API Architecture](ee-api-architecture.md) — synatic proxy works with Bearer JWT; order endpoints require AWS IAM auth (blocked)
