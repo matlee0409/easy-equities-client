@@ -1119,14 +1119,25 @@ class InstrumentsClient(Client):
                 if i.get("AssetGroup") == asset_group
             ]
 
-        # Deduplicate by contract code
-        seen: set = set()
+        # Deduplicate by contract code AND resolved Yahoo ticker.
+        # The same instrument can appear with several contract codes for
+        # different trading currencies, all resolving to the same Yahoo ticker.
+        seen_codes: set = set()
+        seen_tickers: set = set()
         unique: List[InstrumentDetail] = []
         for inst in all_instruments:
             code = inst.get("ContractCode", "")
-            if code and code not in seen:
-                seen.add(code)
-                unique.append(inst)
+            ticker = _resolve_yahoo_ticker(inst)
+            if not code:
+                continue
+            if code in seen_codes:
+                continue
+            if ticker and ticker in seen_tickers:
+                continue
+            seen_codes.add(code)
+            if ticker:
+                seen_tickers.add(ticker)
+            unique.append(inst)
 
         scored: List[SearchMatch] = []
         for inst in unique:
