@@ -9,6 +9,8 @@ from easy_equities_client.instruments.types import (
     HistoricalPrices,
     InstrumentComparison,
     InstrumentDetail,
+    NewsHeadline,
+    NewsResult,
     NormalisedPoint,
     Period,
     PricePoint,
@@ -1170,4 +1172,151 @@ class InstrumentsClient(Client):
             "query": q,
             "total": len(results),
             "results": results,
+        }
+
+    def news(
+        self,
+        contract_code_or_ticker: str,
+        max_results: int = 10,
+    ) -> NewsResult:
+        """
+        Fetch recent news headlines for an instrument via Google News RSS.
+
+        Accepts either a contract code (e.g. ``"EQU5.JO"``) or a Yahoo-style
+        ticker (e.g. ``"TSLA"``, ``"NVDA"``). When the instrument is found in
+        the EasyEquities catalogue the full company name is used as the search
+        query for better headline relevance; otherwise the raw input is used.
+
+        No API key or external package required — uses only Python stdlib
+        (``urllib`` and ``xml.etree.ElementTree``).
+
+        :param contract_code_or_ticker: Contract code or ticker to look up.
+        :param max_results: Maximum number of headlines to return. Default 10.
+        :return: ``NewsResult`` dict:
+
+            - ``instrument``  — resolved instrument name (or raw input)
+            - ``query``       — search string sent to Google News
+            - ``total``       — number of headlines returned
+            - ``headlines``   — list of ``NewsHeadline`` dicts
+            - ``message``     — error detail when fetch fails
+
+            Each ``NewsHeadline`` contains:
+            ``title``, ``source``, ``published`` (RFC-2822 string), ``url``.
+
+        Examples::
+
+            result = client.instruments.news("TSLA")
+            result = client.instruments.news("EQU5.JO")
+            result = client.instruments.news("NVDA", max_results=5)
+
+            for h in result["headlines"]:
+                print(h["published"], h["source"])
+                print(" ", h["title"])
+                print(" ", h["url"])
+        """
+        import urllib.request
+        import urllib.parse
+        import xml.etree.ElementTree as ET
+        import re
+
+        raw = contract_code_or_ticker.strip()
+
+        # --- 1. Resolve instrument name from catalogue ---
+        instrument_name = raw
+        try:
+            all_instruments = self._fetch_all_instruments()
+            raw_upper = raw.upper()
+            raw_lower = raw.lower()
+            for inst in all_instruments:
+                code = inst.get("ContractCode", "").upper()
+                ticker = (_resolve_yahoo_ticker(inst) or "").upper()
+                if code == raw_upper or ticker == raw_upper:
+                    instrument_name = inst.get("InstrumentName", raw)
+                    break
+        except Exception:
+            pass  # fall back to raw input as search query
+
+        # Build Google News RSS query: instrument name + "stock" for equities,
+        # just the name for ETFs/Crypto.
+        search_query = instrument_name
+        query_encoded = urllib.parse.quote(search_query)
+        url = (
+            f"https://news.google.com/rss/search"
+            f"?q={query_encoded}"
+            f"&hl=en-US&gl=US&ceid=US:en"
+        )
+
+        # --- 2. Fetch RSS feed ---
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (compatible; EasyEquitiesClient/1.0)"
+                    )
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml_bytes = resp.read()
+        except Exception as exc:
+            return {
+                "instrument": instrument_name,
+                "query": search_query,
+                "total": 0,
+                "headlines": [],
+                "message": f"Failed to fetch Google News RSS: {exc}",
+            }
+
+        # --- 3. Parse RSS XML ---
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError as exc:
+            return {
+                "instrument": instrument_name,
+                "query": search_query,
+                "total": 0,
+                "headlines": [],
+                "message": f"Failed to parse RSS XML: {exc}",
+            }
+
+        ns = {"media": "http://search.yahoo.com/mrss/"}
+        items = root.findall(".//item")
+        headlines: List[NewsHeadline] = []
+
+        for item in items[:max_results]:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pub_el = item.find("pubDate")
+            source_el = item.find("source")
+
+            title = title_el.text or "" if title_el is not None else ""
+            link = link_el.text or "" if link_el is not None else ""
+            published = pub_el.text or "" if pub_el is not None else ""
+            source = source_el.text or "" if source_el is not None else ""
+
+            # Google News RSS titles include " - Source Name" at the end;
+            # strip it so the title is clean (we already capture source separately).
+            if source and title.endswith(f" - {source}"):
+                title = title[: -(len(source) + 3)]
+
+            # Google News wraps links in a redirect; extract the real URL
+            # from the href attribute of <link> when present, otherwise keep as-is.
+            real_url = link
+            google_redirect = re.search(r"url=([^&]+)", link)
+            if google_redirect:
+                real_url = urllib.parse.unquote(google_redirect.group(1))
+
+            headlines.append({
+                "title": title.strip(),
+                "source": source.strip(),
+                "published": published.strip(),
+                "url": real_url.strip(),
+            })
+
+        return {
+            "instrument": instrument_name,
+            "query": search_query,
+            "total": len(headlines),
+            "headlines": headlines,
+            "message": None,
         }

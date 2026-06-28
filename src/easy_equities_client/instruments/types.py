@@ -162,3 +162,18 @@ class SearchResult(TypedDict):
     query: str
     total: int
     results: List[SearchMatch]
+
+
+class NewsHeadline(TypedDict):
+    title: str
+    source: str
+    published: str
+    url: str
+
+
+class NewsResult(TypedDict):
+    instrument: str
+    query: str
+    total: int
+    headlines: List[NewsHeadline]
+    message: Optional[str]
