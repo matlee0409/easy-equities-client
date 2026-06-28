@@ -4,12 +4,12 @@ Unofficial Python client for [Easy Equities](https://easyequities.io/) and [Satr
 
 Supports Python 3.8+.
 
-[PyPI](https://pypi.org/project/easyequities-client/)
+[PyPI](https://pypi.org/project/pyeasyequities/)
 
 ## Installation
 
 ```
-pip install easyequities-client
+pip install pyeasyequities
 ```
 
 ## Features

@@ -1,5 +1,5 @@
 [project]
-name = "easyequities-client"
+name = "pyeasyequities"
 version = "2.0.0"
 description = "Unofficial Easy Equities and Satrix Python Client"
 readme = "README.md"
